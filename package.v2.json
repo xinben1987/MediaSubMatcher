@@ -1,5 +1,5 @@
-[
-  {
+{
+  "mediasubmatcher": {
     "id": "mediasubmatcher",
     "name": "中文字幕匹配",
     "description": "扫描Jellyfin媒体库，为缺少中文字幕的电影/剧集自动搜索下载中文字幕并落盘，可选ffsubsync对齐时间轴。已有中文字幕的自动跳过。",
@@ -7,6 +7,9 @@
     "version": "1.0.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/substrata.png",
     "level": 1,
+    "history": {
+      "v1.0.0": "初次发布：扫描 Jellyfin 媒体库自动匹配下载中文字幕，支持 PushPlus 推送"
+    },
     "v2": true
   }
-]
+}
