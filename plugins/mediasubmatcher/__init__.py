@@ -136,7 +136,7 @@ class MediaSubMatcher(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/substrata.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "leon"
     # 作者主页
@@ -1272,12 +1272,23 @@ class MediaSubMatcher(_PluginBase):
                 cmd += [video, "-i", sub, "-o", tmp]
                 proc = subprocess.run(cmd, capture_output=True, timeout=1800)
                 if proc.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 100:
-                    os.replace(tmp, sub)
-                    logger.info(f"{self.plugin_name} 后台对齐完成：{Path(sub).name}")
-                    _wb_push(f"【字幕·对齐】{Path(sub).name}",
-                             f"<b>状态</b>：✅ 后台对齐完成<br><b>文件</b>：{Path(sub).name}<br>"
-                             f"<br><span style='color:#888'>MediaSubMatcher</span>")
-                    self._bump_align_stat("rdone" if item.get("realign") else "done")
+                    qok, qmsg = self._ffsubsync_quality_check(
+                        (proc.stdout or b"").decode("utf-8", "replace"),
+                        Path(tmp), self._video_duration(video))
+                    if not qok:
+                        os.remove(tmp)
+                        logger.warning(f"{self.plugin_name} 后台对齐产物质量异常（保留原字幕）：{Path(sub).name} | {qmsg}")
+                        _wb_push(f"【字幕·对齐】{Path(sub).name}",
+                                 f"<b>状态</b>：⚠️ 对齐产物质量异常（保留原字幕）<br><b>文件</b>：{Path(sub).name}<br><b>原因</b>：{qmsg}<br>"
+                                 f"<br><span style='color:#888'>MediaSubMatcher</span>")
+                        self._bump_align_stat("rfail" if item.get("realign") else "fail")
+                    else:
+                        os.replace(tmp, sub)
+                        logger.info(f"{self.plugin_name} 后台对齐完成：{Path(sub).name}")
+                        _wb_push(f"【字幕·对齐】{Path(sub).name}",
+                                 f"<b>状态</b>：✅ 后台对齐完成<br><b>文件</b>：{Path(sub).name}<br>"
+                                 f"<br><span style='color:#888'>MediaSubMatcher</span>")
+                        self._bump_align_stat("rdone" if item.get("realign") else "done")
                 else:
                     tail = " ".join((proc.stderr or b"").decode("utf-8", "replace").split())[-260:]
                     logger.warning(f"{self.plugin_name} 后台对齐失败（保留原字幕）：{Path(sub).name} | ret={proc.returncode} | {tail}")
@@ -2303,6 +2314,60 @@ class MediaSubMatcher(_PluginBase):
                 best, best_score = (name, content), score
         return best
 
+    @staticmethod
+    def _ffsubsync_quality_check(stdout_text: str, out_srt, video_dur: Optional[float]) -> Tuple[bool, str]:
+        """
+        ffsubsync 产物质量自检（v1.1.0 加）：
+        1) stdout 里的 offset / 帧率因子 超阈值 → 拒绝
+        2) 产物末条时间轴与视频时长明显不符 → 拒绝
+        返回 (是否可用, 说明)
+        """
+        try:
+            off = scale = None
+            m = re.search(r"offset seconds://s*(-?[//d.]+)", stdout_text or "")
+            if m:
+                off = float(m.group(1))
+            m = re.search(r"framerate scale factor://s*([//d.]+)", stdout_text or "")
+            if m:
+                scale = float(m.group(1))
+            if off is not None and abs(off) > 600:
+                return False, f"offset {off:.1f}s 超阈值(±600s)"
+            if scale is not None and not (0.9 <= scale <= 1.15):
+                return False, f"帧率因子 {scale:.3f} 超阈值(0.90~1.15)"
+            if out_srt is not None:
+                try:
+                    txt = Path(out_srt).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    txt = ""
+                ts = [int(h) * 3600 + int(mn) * 60 + int(s) + int(ms) / 1000
+                      for h, mn, s, ms in re.findall(r"(\d+):(\d+):(\d+),(\d+)\s*-->", txt)]
+                if ts and video_dur:
+                    last = max(ts)
+                    if last > video_dur * 1.15 or last < video_dur * 0.4:
+                        return False, f"产物末条 {last:.0f}s 与视频时长 {video_dur:.0f}s 明显不符"
+            detail = []
+            if off is not None:
+                detail.append(f"offset {off:+.1f}s")
+            if scale is not None:
+                detail.append(f"帧率 {scale:.3f}")
+            return True, "，".join(detail) if detail else "无质量数据"
+        except Exception as err:
+            return True, f"自检异常（放行）：{err}"
+
+    @staticmethod
+    def _video_duration(video_path: str) -> Optional[float]:
+        """ffprobe 读视频时长（秒）；不可用返回 None。"""
+        fp = shutil.which("ffprobe")
+        if not fp:
+            return None
+        try:
+            proc = subprocess.run([fp, "-v", "error", "-show_entries", "format=duration",
+                                   "-of", "csv=p=0", str(video_path)],
+                                  capture_output=True, timeout=60)
+            return float(proc.stdout.decode("utf-8", "replace").strip() or 0) or None
+        except Exception:
+            return None
+
     def _align_subtitle(self, video_path: str, sub_src: Path, sub_dst: Path) -> bool:
         """
         ffsubsync 对齐；失败则直接用原字幕（复制）
@@ -2317,7 +2382,24 @@ class MediaSubMatcher(_PluginBase):
             logger.info(f"{self.plugin_name} 开始对齐时间轴：{sub_src.name}")
             proc = subprocess.run(cmd, capture_output=True, timeout=900)
             if proc.returncode == 0 and sub_dst.exists():
-                logger.info(f"{self.plugin_name} 对齐完成：{sub_dst.name}")
+                qok, qmsg = self._ffsubsync_quality_check(
+                    (proc.stdout or b"").decode("utf-8", "replace"),
+                    sub_dst, self._video_duration(str(video_path)))
+                if not qok:
+                    try:
+                        sub_dst.unlink()
+                    except OSError:
+                        pass
+                    logger.warning(f"{self.plugin_name} 对齐产物质量异常（回滚用原字幕）：{sub_dst.name} | {qmsg}")
+                    shutil.copyfile(sub_src, sub_dst)
+                    return True
+                logger.info(f"{self.plugin_name} 对齐完成：{sub_dst.name} | {qmsg}")
+                try:
+                    _done = self._fget("realign_done") or {}
+                    _done[str(sub_dst)] = time.time()
+                    self._fsave("realign_done", _done)
+                except Exception:
+                    pass
                 return True
             logger.warning(f"{self.plugin_name} 对齐失败（ret={proc.returncode}），使用未对齐字幕")
         except Exception as err:
