@@ -51,6 +51,7 @@ _align_queue = None       # 后台对齐队列（惰性初始化）
 _align_worker_on = False  # 对齐 worker 已启动标记
 _align_lock = threading.Lock()  # 对齐队列初始化锁
 _run_start_ts = 0         # 本次运行开始时间（看门狗用）
+_notify_lock = threading.Lock()  # 事件汇总缓冲锁（对齐 worker 线程与主流程并发写）
 
 # 字幕文件后缀（可落盘的文本字幕）
 SUB_EXTS = {".srt", ".ass", ".ssa"}
@@ -97,8 +98,16 @@ def _parse_season_episode(text: str) -> Tuple[Optional[int], List[int]]:
     return season, eps
 
 
+def _wb_esc(text) -> str:
+    """汇总消息里的 HTML 转义（文件名可能含 & < >）"""
+    return (str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
 def _wb_push(title, content):
-    """【2026-09-30 新增】把字幕匹配/对齐状态推送到 PushPlus（后台线程，失败静默）。"""
+    """把消息推送到 PushPlus（后台线程，失败静默）。
+
+    v1.3.0 起本函数只由 _notify_flush() 调用一次/轮，不再是逐条事件推送。
+    """
     def _w():
         try:
             tk = ""
@@ -136,7 +145,7 @@ class MediaSubMatcher(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/substrata.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "leon"
     # 作者主页
@@ -697,6 +706,19 @@ class MediaSubMatcher(_PluginBase):
             align_txt = f"已对齐 {t_ok} 条"
             if t_fail:
                 align_txt += f"，{t_fail} 条无法对齐（保留原字幕）"
+        # v1.3.0 事件汇总：待推送缓冲 + 上次推送时间
+        try:
+            pending_n = len(self._fget("notify_pending") or [])
+        except Exception:
+            pending_n = 0
+        try:
+            _last_push = float(self._fget("notify_last_ts") or 0)
+        except (TypeError, ValueError):
+            _last_push = 0
+        push_txt = ("上次汇总推送：" + time.strftime("%m-%d %H:%M", time.localtime(_last_push))) \
+            if _last_push else "尚未汇总推送"
+        notify_txt = (f"待汇总事件 {pending_n} 条｜{push_txt}｜"
+                      f"按“发送通知”开关，每轮扫描（{self._interval}h）汇总推送一次")
         page = [
             {
                 "component": "VRow",
@@ -751,6 +773,25 @@ class MediaSubMatcher(_PluginBase):
                                     "type": "info",
                                     "variant": "tonal",
                                     "text": "时间轴对齐累计 — " + align_txt,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "success",
+                                    "variant": "tonal",
+                                    "text": "通知方式（v1.3.0）— " + notify_txt,
                                 },
                             }
                         ],
@@ -1015,8 +1056,12 @@ class MediaSubMatcher(_PluginBase):
             "summary": summary,
         })
         self._safe_save_data("history", history)
-        if self._notify:
-            self.post_message(title=self.plugin_name, text=summary)
+        # v1.3.0：取消「每轮摘要单独推 + 逐条事件推」，改为
+        # 本轮摘要并入事件缓冲，与匹配/对齐/拦截事件一起汇总成一条推送
+        # （配合 interval=6h 的扫描节奏 → 每天约 4 条；5h 最小间隔防止手动扫描多发）
+        if searched > 0:
+            self._notify_add("run", summary)
+        self._notify_flush()
         logger.info(f"{self.plugin_name} 运行完成：{summary}")
 
     # ---------------- Jellyfin ----------------
@@ -1278,24 +1323,19 @@ class MediaSubMatcher(_PluginBase):
                     if level in ("fail", "warn"):
                         os.remove(tmp)
                         logger.warning(f"{self.plugin_name} 后台对齐产物质量未达标（保留原字幕）：{Path(sub).name} | {qmsg}")
-                        _wb_push(f"【字幕·对齐】{Path(sub).name}",
-                                 f"<b>状态</b>：⚠️ 对齐产物质量未达标（保留原字幕）<br><b>文件</b>：{Path(sub).name}<br><b>原因</b>：{qmsg}<br>"
-                                 f"<br><span style='color:#888'>MediaSubMatcher</span>")
+                        self._notify_add("align", Path(sub).name,
+                                         f"⚠️ 对齐质量未达标（保留原字幕）：{qmsg}")
                         self._bump_align_stat("rfail" if item.get("realign") else "fail")
                     else:
                         os.replace(tmp, sub)
                         logger.info(f"{self.plugin_name} 后台对齐完成：{Path(sub).name}")
-                        _wb_push(f"【字幕·对齐】{Path(sub).name}",
-                                 f"<b>状态</b>：✅ 后台对齐完成<br><b>文件</b>：{Path(sub).name}<br>"
-                                 f"<br><span style='color:#888'>MediaSubMatcher</span>")
+                        self._notify_add("align", Path(sub).name, "✅ 对齐完成")
                         self._bump_align_stat("rdone" if item.get("realign") else "done")
                 else:
                     tail = " ".join((proc.stderr or b"").decode("utf-8", "replace").split())[-260:]
                     logger.warning(f"{self.plugin_name} 后台对齐失败（保留原字幕）：{Path(sub).name} | ret={proc.returncode} | {tail}")
-                    _wb_push(f"【字幕·对齐】{Path(sub).name}",
-                             f"<b>状态</b>：⚠️ 对齐失败（保留原字幕）<br><b>文件</b>：{Path(sub).name}<br>"
-                             f"<b>ret</b>：{proc.returncode}<br>"
-                             f"<br><span style='color:#888'>MediaSubMatcher</span>")
+                    self._notify_add("align", Path(sub).name,
+                                     f"⚠️ 对齐失败（保留原字幕）ret={proc.returncode}")
                     self._bump_align_stat("rfail" if item.get("realign") else "fail")
                     if os.path.exists(tmp):
                         os.remove(tmp)
@@ -1357,6 +1397,103 @@ class MediaSubMatcher(_PluginBase):
         t.join(timeout)
         if t.is_alive():
             logger.warning(f"{self.plugin_name} save_data[{key}] 超时放弃（数据已存本地文件）")
+
+    # ---------------- 事件汇总通知（v1.3.0） ----------------
+    # 变化点：原先「匹配落盘 / 后台对齐完成 / 对齐失败 / 对齐质量不达标 / 正确性拦截」
+    #         5 类事件逐条推 PushPlus（实测约 190 条/天），现改为写入缓冲，
+    #         每轮扫描结束时汇总成一条推送 → 配合 interval=6h 即每天约 4 条。
+
+    _NOTIFY_MIN_GAP = 5 * 3600   # 两次汇总的最小间隔（< 扫描间隔 6h，保证每轮都能推）
+    _NOTIFY_MAX_KEEP = 500       # 缓冲上限（notify 关闭时也不会无限增长）
+    _NOTIFY_MAX_ITEMS = 60       # 每个分区最多列出的明细条数（超出只给计数）
+    _NOTIFY_SECTIONS = (
+        ("match", "✅ 匹配落盘"),
+        ("align", "🎬 时间轴对齐"),
+        ("block", "⛔ 正确性拦截"),
+    )
+
+    def _notify_add(self, kind: str, item: str, note: str = ""):
+        """把一条字幕事件写入待推送缓冲（不再逐条推送）。kind 取 match/align/block/run"""
+        try:
+            with _notify_lock:
+                buf = self._fget("notify_pending") or []
+                if not isinstance(buf, list):
+                    buf = []
+                buf.append({
+                    "t": time.strftime("%H:%M"),
+                    "k": str(kind or "other"),
+                    "i": str(item or ""),
+                    "n": str(note or ""),
+                })
+                if len(buf) > self._NOTIFY_MAX_KEEP:
+                    del buf[:-self._NOTIFY_MAX_KEEP]
+                self._fsave("notify_pending", buf)
+        except Exception as err:
+            logger.warning(f"{self.plugin_name} 事件缓冲写入失败：{err}")
+
+    def _notify_flush(self, force: bool = False) -> bool:
+        """
+        把缓冲里的事件汇总成一条 HTML 推送，并清空缓冲。
+
+        节流：两次推送间隔 < _NOTIFY_MIN_GAP（5h）时**不推送、不清缓冲**，
+        事件留到下一轮扫描一并汇总 —— 保证每天推送次数 ≈ 24h/扫描间隔。
+        受插件配置项「发送通知」(notify) 控制。
+        """
+        if not self._notify:
+            return False
+        now = time.time()
+        try:
+            last = float(self._fget("notify_last_ts") or 0)
+        except (TypeError, ValueError):
+            last = 0
+        if not force and last and (now - last) < self._NOTIFY_MIN_GAP:
+            logger.info(
+                f"{self.plugin_name} 事件汇总未达推送间隔（{(now - last) / 3600:.1f}h < "
+                f"{self._NOTIFY_MIN_GAP / 3600:.0f}h），留到下轮扫描一并汇总"
+            )
+            return False
+        with _notify_lock:
+            buf = self._fget("notify_pending") or []
+            if not isinstance(buf, list):
+                buf = []
+            if not buf:
+                self._fsave("notify_last_ts", now)
+                return False
+            # 先清缓冲再推送（推送在子线程发出），避免与并发写入产生重复
+            self._fsave("notify_pending", [])
+        counts = {}
+        for e in buf:
+            k = str(e.get("k") or "other")
+            counts[k] = counts.get(k, 0) + 1
+        head = " ".join(
+            f"{label}{counts[kind]}" for kind, label in self._NOTIFY_SECTIONS if counts.get(kind)
+        )
+        title = f"中文字幕匹配 · {head}" if head else "中文字幕匹配 · 汇总"
+        parts = [f"<b>中文字幕匹配 · 事件汇总</b><br>"
+                 f"<span style='color:#888'>{time.strftime('%Y-%m-%d %H:%M')}　"
+                 f"共 {len(buf)} 条事件</span>"]
+        for e in buf:
+            if str(e.get("k")) == "run":
+                parts.append(f"<br><b>本轮搜索</b>：{_wb_esc(e.get('i'))}")
+        for kind, label in self._NOTIFY_SECTIONS:
+            items = [e for e in buf if str(e.get("k")) == kind]
+            if not items:
+                continue
+            parts.append(f"<hr><b>{label}（{len(items)}）</b>")
+            hidden = len(items) - self._NOTIFY_MAX_ITEMS
+            for e in items[-self._NOTIFY_MAX_ITEMS:]:
+                note = _wb_esc(e.get("n"))
+                line = f"· {_wb_esc(e.get('t'))}　{_wb_esc(e.get('i'))}"
+                if note:
+                    line += f"　— {note}"
+                parts.append(line)
+            if hidden > 0:
+                parts.append(f"… 另有 {hidden} 条同类事件（明细见插件日志）")
+        parts.append("<br><span style='color:#888'>每轮扫描汇总推送一次 · MediaSubMatcher</span>")
+        _wb_push(title, "<br>".join(parts))
+        self._fsave("notify_last_ts", now)
+        logger.info(f"{self.plugin_name} 事件汇总已推送：{title}（{len(buf)} 条）")
+        return True
 
     @staticmethod
     def _valid_sub_content(content: bytes) -> bool:
@@ -2514,10 +2651,8 @@ class MediaSubMatcher(_PluginBase):
             _ok, _sdur, _smsg = self._subtitle_duration_ok(_text, _vdur)
             if not _ok:
                 logger.warning(f"{self.plugin_name} 字幕正确性判定未通过，拒绝挂载：{file_name} | {_smsg}")
-                _wb_push(f"【字幕·拦截】{video.stem}",
-                         f"<b>状态</b>：⛔ 字幕正确性判定未通过，已拒绝挂载<br>"
-                         f"<b>字幕文件</b>：{file_name}<br><b>原因</b>：{_smsg}<br>"
-                         f"<br><span style='color:#888'>MediaSubMatcher</span>")
+                self._notify_add("block", video.stem,
+                                 f"⛔ {file_name} 正确性判定未通过已拒绝：{_smsg}")
                 return False
         ext = Path(file_name).suffix.lower()
         final_path = video.parent / f"{video.stem}.{self._lang_tag}{ext}"
@@ -2543,10 +2678,7 @@ class MediaSubMatcher(_PluginBase):
             try:
                 shutil.move(str(tmp_path), str(final_path))
                 self._enqueue_align(str(video), str(final_path))
-                _wb_push(f"【字幕】{video.stem}",
-                         f"<b>状态</b>：✅ 已匹配（待后台对齐）<br>"
-                         f"<b>字幕文件</b>：{final_path.name}<br>"
-                         f"<br><span style='color:#888'>MediaSubMatcher</span>")
+                self._notify_add("match", final_path.name, "✅ 已匹配（待后台对齐）")
                 return True
             except OSError as err:
                 logger.error(f"{self.plugin_name} 保存字幕失败：{err}")
@@ -2554,10 +2686,7 @@ class MediaSubMatcher(_PluginBase):
         try:
             shutil.move(str(tmp_path), str(final_path))
             logger.info(f"{self.plugin_name} 字幕已保存：{final_path}")
-            _wb_push(f"【字幕】{video.stem}",
-                     f"<b>状态</b>：✅ 已匹配并落盘<br>"
-                     f"<b>字幕文件</b>：{final_path.name}<br>"
-                     f"<br><span style='color:#888'>MediaSubMatcher</span>")
+            self._notify_add("match", final_path.name, "✅ 已匹配并落盘")
             return True
         except OSError as err:
             logger.error(f"{self.plugin_name} 保存字幕失败：{err}")
