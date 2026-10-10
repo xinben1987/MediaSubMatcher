@@ -4,7 +4,7 @@
     "name": "中文字幕匹配",
     "description": "扫描Jellyfin媒体库，为缺少中文字幕的电影/剧集自动搜索下载中文字幕并落盘，可选ffsubsync对齐时间轴。已有中文字幕的自动跳过。",
     "author": "leon",
-    "version": "1.3.0",
+    "version": "1.4.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/substrata.png",
     "level": 1,
     "history": {
@@ -12,7 +12,8 @@
       "v1.0.1": "接入插件仓库（建立来源绑定）",
       "v1.1.0": "对齐产物质量自检（offset/帧率/时长阈值，异常回滚保留原字幕）+ 前台对齐补记 realign_done（堵重复对齐）",
       "v1.2.0": "字幕正确性判定（时长粗比对拦截错配）+ 对齐质量三态自检（ok/warn/fail，帧率因子偏离告警）",
-      "v1.3.0": "推送改汇总：匹配/对齐/拦截事件不再逐条推送，改为入缓冲、每轮扫描汇总成一条 PushPlus（约 4 条/天）；取消每轮摘要单独推送；5h 最小间隔防手动扫描多发；面板新增待汇总计数"
+      "v1.3.0": "推送改汇总：匹配/对齐/拦截事件不再逐条推送，改为入缓冲、每轮扫描汇总成一条 PushPlus（约 4 条/天）；取消每轮摘要单独推送；5h 最小间隔防手动扫描多发；面板新增待汇总计数",
+      "v1.4.0": "新增第 4 个字幕源 SubHD（subhd.tv/me/one/cc 自动故障转移，免登录；prepare-download→/api/sub/down 取直链，带预览兜底）；字幕包解包支持 7z/rar（调用容器内 unar）；修正表单里过时的来源说明"
     },
     "v2": true
   }
