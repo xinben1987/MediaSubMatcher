@@ -3,7 +3,7 @@
 中文字幕匹配插件（MediaSubMatcher）
 
 扫描 Jellyfin 媒体库，为缺少中文字幕的电影/剧集自动：
-1. 通过字幕库（zmk.pw）/ OpenSubtitles / assrt.net 搜索中文字幕
+1. 通过字幕库（zmk.pw）/ OpenSubtitles / assrt.net / SubHD 搜索中文字幕
 2. 按季集/分辨率/语言挑选最佳匹配
 3. 下载解压，按 <视频名>.<标签>.<后缀> 命名落盘到视频同目录
 4. 可选 ffsubsync 对齐时间轴（基于视频音轨）
@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -57,8 +58,12 @@ _notify_lock = threading.Lock()  # 事件汇总缓冲锁（对齐 worker 线程�
 SUB_EXTS = {".srt", ".ass", ".ssa"}
 # 可对齐的后缀（ffsubsync 对 srt/ass 都能对齐，且实测保留 ASS 的 [V4+ Styles] 与全部对话）
 ALIGNABLE_EXTS = {".srt", ".ass"}
-# 压缩包后缀
-ARCHIVE_EXTS = {".zip"}
+# 压缩包后缀（zip 走内置 zipfile；7z/rar 走容器内 unar，见 _extract_with_unar）
+ARCHIVE_EXTS = {".zip", ".7z", ".rar"}
+# SubHD 字幕站（按序故障转移；解析口径对应 2026-10 现版页面）
+SUBHD_HOSTS = ("subhd.tv", "subhd.me", "subhd.one", "subhd.cc")
+SUBHD_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 
 # 中文标记（用于判定字幕语言）
 CN_MARKERS = ["简", "繁", "中字", "中文", "chs", "cht", "zh", "gb", "big5", "sc&tc", "sc", "tc"]
@@ -145,7 +150,7 @@ class MediaSubMatcher(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/substrata.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "leon"
     # 作者主页
@@ -663,7 +668,7 @@ class MediaSubMatcher(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": "扫描Jellyfin电影/剧集，缺中文字幕的自动搜索下载，"
-                                                    "字幕源：PT站字幕区 + 字幕库zmk.pw（需过墙Cookie）+ OpenSubtitles（需API Key，可选）。"
+                                                    "字幕源：字幕库zmk.pw（需过墙Cookie）+ OpenSubtitles（需API Key）+ assrt.net（需token）+ SubHD（免登录，四域名自动故障转移）。"
                                                     "按 <视频名>.标签.后缀 命名落盘后触发刷库。已有中文字幕（内封或外挂）自动跳过；"
                                                     "视频同目录已有同名字幕文件（无论语言）也跳过，避免重复。搜不到的只记日志。",
                                         },
@@ -1793,17 +1798,19 @@ class MediaSubMatcher(_PluginBase):
         聚合三源并行：字幕库 zmk.pw + OpenSubtitles + assrt.net（射手网·伪站）
         （MP 站点字幕区已于 2026-09-30 停用：站表 20 站中仅少数站有字幕 indexer 定义，长期有效 0 条）
         """
-        logger.info(f"{self.plugin_name} [搜索] {keyword} → 三源并行")
+        logger.info(f"{self.plugin_name} [搜索] {keyword} → 四源并行（zmk / OpenSubtitles / assrt / SubHD）")
         results: List[Any] = []
 
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=3) as ex:
+        with ThreadPoolExecutor(max_workers=4) as ex:
             f2 = ex.submit(self._search_zmk, keyword)
             f3 = ex.submit(self._search_os, keyword)
             f4 = ex.submit(self._search_assrt, keyword)
+            f5 = ex.submit(self._search_subhd, keyword)
             zmk = f2.result()
             os_subs = f3.result()
             assrt = f4.result()
+            subhd = f5.result()
         if zmk:
             logger.info(f"{self.plugin_name} 字幕库[{keyword}] 命中 {len(zmk)} 条")
             results.extend(zmk)
@@ -1813,8 +1820,11 @@ class MediaSubMatcher(_PluginBase):
         if assrt:
             logger.info(f"{self.plugin_name} assrt[{keyword}] 命中 {len(assrt)} 条")
             results.extend(assrt)
+        if subhd:
+            logger.info(f"{self.plugin_name} SubHD[{keyword}] 命中 {len(subhd)} 条")
+            results.extend(subhd)
         if not results:
-            logger.warning(f"{self.plugin_name} [搜索] {keyword} 三源均无结果")
+            logger.warning(f"{self.plugin_name} [搜索] {keyword} 四源均无结果")
         return results
     def _zmk_cookie_dict(self) -> Dict[str, str]:
         ck = {}
@@ -2316,6 +2326,120 @@ class MediaSubMatcher(_PluginBase):
         logger.warning(f"{self.plugin_name} assrt 无可用下载直链[{sub_id}]")
         return None
 
+    def _subhd_session(self) -> requests.Session:
+        """
+        建立带浏览器 UA 的会话（SubHD 的 prepare → 落地页 → down 三步靠 Cookie 绑定）
+        """
+        s = requests.Session()
+        s.headers.update({"User-Agent": SUBHD_UA})
+        return s
+
+    def _search_subhd(self, keyword: str) -> List[Any]:
+        """
+        SubHD（subhd.tv / subhd.me / subhd.one / subhd.cc，免登录、无验证码）
+        搜索页服务端渲染卡片；按 SUBHD_HOSTS 顺序故障转移。
+        注意：搜索页还混着"热门电影/剧集"的 /d/<id> 链接，必须用结果卡 class 锚定。
+        """
+        from types import SimpleNamespace
+        out: List[Any] = []
+        for host in SUBHD_HOSTS:
+            try:
+                r = self._subhd_session().get(
+                    "https://%s/search/%s" % (host, quote(keyword)),
+                    timeout=25,
+                    headers={"Referer": "https://%s/" % host},
+                )
+                if r is None or r.status_code != 200:
+                    continue
+                cards = r.text.split('class="bg-white shadow-sm rounded-3 mb-4"')[1:]
+                if not cards:
+                    continue
+                for card in cards[:15]:
+                    codes = re.findall("/a/([A-Za-z0-9]{4,12})", card)
+                    if not codes:
+                        continue
+                    sid = codes[0]
+                    m = re.search('<a class="link-dark align-middle"[^>]*>([^<]{1,200})</a>', card)
+                    cn_name = (m.group(1) if m else "").strip()
+                    m2 = re.search('<div class="view-text text-secondary">.{0,300}?>([^<]{3,300})</a>', card, re.S)
+                    pack = (m2.group(1) if m2 else "").strip()
+                    tags = [t.strip() for t in re.findall('<span class="[^"]*">([^<]{1,14})</span>', card)
+                            if t.strip() and not t.strip().isdigit()]
+                    title = (cn_name + " " + pack).strip() or ("subhd-" + sid)
+                    out.append(SimpleNamespace(
+                        title=title,
+                        description=(" ".join(tags) + " subhd/" + host).strip(),
+                        file_name=pack or cn_name,
+                        language="zh" if _has_cn_text(cn_name + pack) else "",
+                        site_name="SubHD",
+                        enclosure="subhdfile:" + sid,
+                        site_cookie=None,
+                        site_ua=None,
+                        site_proxy=False,
+                        size=0,
+                    ))
+                if out:
+                    return out
+            except Exception as err:
+                logger.warning(f"{self.plugin_name} SubHD 搜索失败（{host}）：{err}")
+        return out
+
+    def _download_subhd(self, sub_id: str):
+        """
+        SubHD 下载（2026-10 现版流程，全部会话绑定）：
+          1) GET  /a/<sid>
+          2) POST /api/sub/prepare-download {"sid"}   → 拿票 + Set-Cookie
+          3) GET  /down/<sid>                         → 必须，生成临时下载页
+          4) POST /api/sub/down {"sid"}               → 直链（pass=true 才可用）
+          5) GET  直链                                 → 压缩包（zip/7z/rar）
+        兜底：GET /api/sub/preview/<sid> 返回单文件文本（仅当后缀属文本字幕时采用）
+        """
+        last = "unknown"
+        for host in SUBHD_HOSTS:
+            try:
+                s = self._subhd_session()
+                base = "https://%s" % host
+                s.get(base + "/a/%s" % sub_id, timeout=25)
+                p = s.post(base + "/api/sub/prepare-download", json={"sid": sub_id}, timeout=25,
+                           headers={"Referer": base + "/a/%s" % sub_id,
+                                    "X-Requested-With": "XMLHttpRequest"})
+                if p is None or p.status_code != 200:
+                    last = "prepare HTTP %s" % getattr(p, "status_code", "N/A")
+                    continue
+                s.get(base + "/down/%s" % sub_id, timeout=30,
+                      headers={"Referer": base + "/a/%s" % sub_id})
+                d = s.post(base + "/api/sub/down", json={"sid": sub_id}, timeout=30,
+                           headers={"Referer": base + "/down/%s" % sub_id,
+                                    "X-Requested-With": "XMLHttpRequest"})
+                j = d.json() if (d is not None and d.status_code == 200) else {}
+                url = (j or {}).get("url")
+                if not url:
+                    last = str((j or {}).get("msg") or "无直链")
+                    continue
+                full = url if url.startswith("http") else base + url
+                r = requests.get(full, timeout=(10, 180), headers={"User-Agent": SUBHD_UA})
+                if r is not None and r.status_code == 200 and r.content:
+                    logger.info(f"{self.plugin_name} SubHD 下载成功[{sub_id}]：{len(r.content)} 字节（{host}）")
+                    return r.content
+                last = "直链 HTTP %s" % getattr(r, "status_code", "N/A")
+            except Exception as err:
+                last = str(err)
+                logger.warning(f"{self.plugin_name} SubHD 下载失败（{host}）：{err}")
+        logger.warning(f"{self.plugin_name} SubHD 无可用下载[{sub_id}]：{last}")
+        try:
+            pv = self._subhd_session().get(
+                "https://%s/api/sub/preview/%s" % (SUBHD_HOSTS[0], sub_id), timeout=25)
+            f = ((pv.json() or {}).get("file") or {}) if pv is not None else {}
+            fname = str(f.get("filename") or "")
+            if Path(fname).suffix.lower() in SUB_EXTS and f.get("content"):
+                data = str(f["content"]).encode("utf-8")
+                if self._valid_sub_content(data):
+                    logger.info(f"{self.plugin_name} SubHD 走预览兜底[{sub_id}]：{fname}")
+                    return data
+        except Exception as err:
+            logger.warning(f"{self.plugin_name} SubHD 预览兜底失败[{sub_id}]：{err}")
+        return None
+
     def _is_chinese_sub(self, sub) -> bool:
         blob = " ".join([sub.title or "", sub.description or "", sub.file_name or "", sub.language or ""])
         return _has_cn_text(blob)
@@ -2383,6 +2507,8 @@ class MediaSubMatcher(_PluginBase):
                 return self._download_os(enc.split(":", 1)[1])
             if enc.startswith("assrtfile:"):
                 return self._download_assrt(enc.split(":", 1)[1])
+            if enc.startswith("subhdfile:"):
+                return self._download_subhd(enc.split(":", 1)[1])
             resp = RequestUtils(ua=sub.site_ua, cookies=sub.site_cookie).get_res(
                 sub.enclosure,
                 proxies=getattr(settings, "PROXY", None) if getattr(sub, "site_proxy", False) else None,
@@ -2401,6 +2527,8 @@ class MediaSubMatcher(_PluginBase):
         每个文件都过内容验证（防错片：如 RAR 伪装 / 非中文字幕）
         """
         out: List[Tuple[str, bytes]] = []
+        if content[:2] == b"7z" or content[:4] == b"Rar!":
+            return self._extract_with_unar(content, sub_title)
         if content[:2] == b"PK":
             try:
                 with zipfile.ZipFile(io.BytesIO(content)) as zf:
@@ -2425,6 +2553,41 @@ class MediaSubMatcher(_PluginBase):
             f"{self.plugin_name} 下载内容未通过字幕验证（非文本或无中文），丢弃[{sub_title}]"
         )
         return []
+
+    def _extract_with_unar(self, content: bytes, sub_title: str) -> List[Tuple[str, bytes]]:
+        """
+        用容器内 unar 解 7z/rar（zip 走 zipfile）。
+        unar 属"非 import 型依赖"→ 每次运行做 shutil.which 自检，缺失只告警不报错。
+        """
+        out: List[Tuple[str, bytes]] = []
+        unar = shutil.which("unar")
+        if not unar:
+            logger.warning(f"{self.plugin_name} 容器内无 unar，跳过 7z/rar 字幕包[{sub_title}]")
+            return out
+        tmpd = tempfile.mkdtemp(prefix="msm_sub_")
+        try:
+            arc = os.path.join(tmpd, "sub.bin")
+            with open(arc, "wb") as fw:
+                fw.write(content)
+            odir = os.path.join(tmpd, "out")
+            os.makedirs(odir, exist_ok=True)
+            res = subprocess.run([unar, "-q", "-f", "-o", odir, arc],
+                                 capture_output=True, timeout=180)
+            if res.returncode != 0:
+                logger.warning(f"{self.plugin_name} unar 解包失败(rc={res.returncode})[{sub_title}]")
+                return out
+            for p in sorted(Path(odir).rglob("*")):
+                if p.is_file() and p.suffix.lower() in SUB_EXTS and "__MACOSX" not in str(p):
+                    data = p.read_bytes()
+                    if self._valid_sub_content(data):
+                        out.append((p.name, data))
+                    else:
+                        logger.info(f"{self.plugin_name} 包内文件未通过中文内容验证，跳过：{p.name}")
+        except Exception as err:
+            logger.error(f"{self.plugin_name} 7z/rar 解包异常[{sub_title}]：{err}")
+        finally:
+            shutil.rmtree(tmpd, ignore_errors=True)
+        return out
 
     def _pick_best_file(self, files: List[Tuple[str, bytes]], season, ep, resolution) -> Optional[Tuple[str, bytes]]:
         best, best_score = None, -1
