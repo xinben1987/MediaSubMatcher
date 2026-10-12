@@ -150,7 +150,7 @@ class MediaSubMatcher(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/substrata.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "leon"
     # 作者主页
@@ -958,6 +958,7 @@ class MediaSubMatcher(_PluginBase):
         # 失败冷却：7天内搜不到的组跳过，避免每轮重复搜同一批；30天后清除记录
         retry_sec = 7 * 86400
         keep_sec = 30 * 86400
+        retry_reserve = 3   # v1.5.0：每轮为「冷却已到期」的重试组预留的搜索名额（最早失败优先，防饿死）
         now_ts = time.time()
         failed_map = self.get_data("failed_map") or {}
         for k in [k for k, ts in failed_map.items() if now_ts - ts > keep_sec]:
@@ -985,40 +986,53 @@ class MediaSubMatcher(_PluginBase):
 
         skipped_cool = 0
         missed_movies, missed_series = [], []
+        jobs = []   # (kind, key, obj)：obj 为 movie dict 或 (series, season, eps)
         for movie in targets_movies:
             key = "m:" + movie["path"]
             if cooling(key):
                 skipped_cool += 1
                 continue
-            if searched >= self._max_keywords:
-                break
-            searched += 1
-            ok = self._process_movie(movie)
-            if ok:
-                failed_map.pop(key, None)
-            else:
-                failed_map[key] = now_ts
-                missed_movies.append(movie)
-            record(f"电影[{movie['name']}] {'已匹配中文字幕' if ok else '未找到可用字幕'}", ok)
-
+            jobs.append(("m", key, movie))
         for (series, season), eps in targets_eps.items():
             key = f"s:{series}|{season}"
             if cooling(key):
                 skipped_cool += 1
                 continue
+            jobs.append(("s", key, (series, season, eps)))
+        # v1.5.0 调度：过冷却的重试组保底优先（最早失败在前），其余保持原顺序（新到旧）——
+        # 修复「新组永远插队、老失败组排队尾饿死」（实测过冷却组 13 天零重试）
+        retry_idx = [i for i, j in enumerate(jobs) if failed_map.get(j[1]) is not None]
+        retry_idx.sort(key=lambda i: failed_map.get(jobs[i][1]) or 0)
+        head = retry_idx[:retry_reserve]
+        order = head + [i for i in range(len(jobs)) if i not in head]
+        if head:
+            logger.info(f"{self.plugin_name} [step3] 本轮优先重试 {len(head)} 组（冷却已到期，最早失败优先）")
+        for i in order:
             if searched >= self._max_keywords:
                 break
+            kind, key, obj = jobs[i]
             searched += 1
-            ok = self._process_series(series, season, eps)
-            if ok:
-                failed_map.pop(key, None)
+            if kind == "m":
+                movie = obj
+                ok = self._process_movie(movie)
+                if ok:
+                    failed_map.pop(key, None)
+                else:
+                    failed_map[key] = now_ts
+                    missed_movies.append(movie)
+                record(f"电影[{movie['name']}] {'已匹配中文字幕' if ok else '未找到可用字幕'}", ok)
             else:
-                failed_map[key] = now_ts
-                missed_series.append({"series": series, "season": season, "eps": eps})
-            record(
-                f"剧集[{series} 第{season}季] {len(eps)}集缺失，{'已匹配' if ok else '未找到可用字幕'}",
-                ok,
-            )
+                series, season, eps = obj
+                ok = self._process_series(series, season, eps)
+                if ok:
+                    failed_map.pop(key, None)
+                else:
+                    failed_map[key] = now_ts
+                    missed_series.append({"series": series, "season": season, "eps": eps})
+                record(
+                    f"剧集[{series} 第{season}季] {len(eps)}集缺失，{'已匹配' if ok else '未找到可用字幕'}",
+                    ok,
+                )
 
         self._safe_save_data("failed_map", failed_map)
         if skipped_cool:
@@ -1424,12 +1438,25 @@ class MediaSubMatcher(_PluginBase):
                 buf = self._fget("notify_pending") or []
                 if not isinstance(buf, list):
                     buf = []
-                buf.append({
+                entry = {
                     "t": time.strftime("%H:%M"),
                     "k": str(kind or "other"),
                     "i": str(item or ""),
                     "n": str(note or ""),
-                })
+                }
+                if entry["k"] == "block":
+                    # v1.5.0：同候选（同名文件）的拦截折叠为一条，计数存 c（如 ×10 集）
+                    merged = False
+                    for e in reversed(buf):
+                        if str(e.get("k")) == "block" and str(e.get("i")) == entry["i"]:
+                            e["c"] = int(e.get("c") or 1) + 1
+                            merged = True
+                            break
+                    if not merged:
+                        entry["c"] = 1
+                        buf.append(entry)
+                else:
+                    buf.append(entry)
                 if len(buf) > self._NOTIFY_MAX_KEEP:
                     del buf[:-self._NOTIFY_MAX_KEEP]
                 self._fsave("notify_pending", buf)
@@ -1466,17 +1493,22 @@ class MediaSubMatcher(_PluginBase):
                 return False
             # 先清缓冲再推送（推送在子线程发出），避免与并发写入产生重复
             self._fsave("notify_pending", [])
+        def _cnt(e):
+            try:
+                return int(e.get("c") or 1)
+            except (TypeError, ValueError):
+                return 1
         counts = {}
         for e in buf:
             k = str(e.get("k") or "other")
-            counts[k] = counts.get(k, 0) + 1
+            counts[k] = counts.get(k, 0) + _cnt(e)
         head = " ".join(
             f"{label}{counts[kind]}" for kind, label in self._NOTIFY_SECTIONS if counts.get(kind)
         )
         title = f"中文字幕匹配 · {head}" if head else "中文字幕匹配 · 汇总"
         parts = [f"<b>中文字幕匹配 · 事件汇总</b><br>"
                  f"<span style='color:#888'>{time.strftime('%Y-%m-%d %H:%M')}　"
-                 f"共 {len(buf)} 条事件</span>"]
+                 f"共 {sum(_cnt(e) for e in buf)} 条事件</span>"]
         for e in buf:
             if str(e.get("k")) == "run":
                 parts.append(f"<br><b>本轮搜索</b>：{_wb_esc(e.get('i'))}")
@@ -1484,11 +1516,14 @@ class MediaSubMatcher(_PluginBase):
             items = [e for e in buf if str(e.get("k")) == kind]
             if not items:
                 continue
-            parts.append(f"<hr><b>{label}（{len(items)}）</b>")
+            parts.append(f"<hr><b>{label}（{sum(_cnt(e) for e in items)}）</b>")
             hidden = len(items) - self._NOTIFY_MAX_ITEMS
             for e in items[-self._NOTIFY_MAX_ITEMS:]:
                 note = _wb_esc(e.get("n"))
                 line = f"· {_wb_esc(e.get('t'))}　{_wb_esc(e.get('i'))}"
+                c = _cnt(e)
+                if c > 1:
+                    line += f"（共 {c} 集）"
                 if note:
                     line += f"　— {note}"
                 parts.append(line)
@@ -2606,10 +2641,12 @@ class MediaSubMatcher(_PluginBase):
                     score += 3
             if ep is not None:
                 _, eps = _parse_season_episode(name)
-                if eps and ep not in eps:
+                if not eps:
+                    # v1.5.0：剧集场景拒绝「无集号线索」的候选（防电影版同名/合集包按集误配）
                     continue
-                if eps and ep in eps:
-                    score += 10
+                if ep not in eps:
+                    continue
+                score += 10
             if score > best_score:
                 best, best_score = (name, content), score
         return best
@@ -2673,11 +2710,17 @@ class MediaSubMatcher(_PluginBase):
 
     @staticmethod
     def _subtitle_duration_ok(text: str, video_dur: float) -> Tuple[bool, Optional[float], str]:
-        """解析字幕时间轴末条，与视频时长粗比对（拦不同影片/严重版本错配）。"""
+        """解析字幕时间轴末条（SRT + ASS 双格式），与视频时长粗比对（拦不同影片/严重版本错配）。
+        v1.5.0：① 支持 ASS（Dialogue 行，H:MM:SS.cc 百分秒）；② 两种格式都解析不到时
+        改为「保守拒绝」（原为放行）——修复 ASS 错配穿透正确性判定的缺口。"""
+        body = text or ""
         ts = [int(h) * 3600 + int(mn) * 60 + int(s) + int(ms) / 1000
-              for h, mn, s, ms in re.findall(r"(\d+):(\d+):(\d+),(\d+)\s*-->", text or "")]
+              for h, mn, s, ms in re.findall(r"(\d+):(\d+):(\d+),(\d+)\s*-->", body)]
         if not ts:
-            return True, None, "未解析到时间轴（放行，交由对齐自检）"
+            for h, mn, s, cs in re.findall(r"(?m)^Dialogue:[^,]*,\s*(\d+):(\d+):(\d+)\.(\d{1,2})", body):
+                ts.append(int(h) * 3600 + int(mn) * 60 + int(s) + int(cs) / (10 ** len(cs)))
+        if not ts:
+            return False, None, "未解析到时间轴（SRT/ASS 均无有效时间轴，保守拒绝）"
         last = max(ts)
         if last < video_dur * 0.7 or last > video_dur * 1.3:
             return False, last, f"字幕末条 {last:.0f}s 与视频时长 {video_dur:.0f}s 明显不符（疑似不同版本/影片）"
