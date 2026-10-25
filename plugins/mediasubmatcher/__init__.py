@@ -150,7 +150,7 @@ class MediaSubMatcher(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/substrata.png"
     # 插件版本
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     # 插件作者
     plugin_author = "leon"
     # 作者主页
@@ -270,7 +270,113 @@ class MediaSubMatcher(_PluginBase):
                 "methods": ["GET"],
                 "summary": "外部挂载字幕：读 plan.json 逐条对齐+落盘（8791 手动挂载面板调用）",
             },
+            {
+                "path": "/search_full",
+                "endpoint": self.search_full_api,
+                "methods": ["GET"],
+                "summary": "在线搜索字幕（四源并行），返回 search_id + 候选清单",
+            },
+            {
+                "path": "/fetch_sub",
+                "endpoint": self.fetch_sub_api,
+                "methods": ["GET"],
+                "summary": "按 search_id+idx 下载并解包字幕，写入 dest（MP 视角），返回文件清单",
+            },
         ]
+
+    # ------------- 在线搜索字幕（8791 手动挂载面板，2026-10-25） -------------
+    _SEARCH_TTL = 1800          # 搜索缓存有效期（秒）
+    _SEARCH_KEEP = 20           # 最多保留的搜索轮数
+
+    def _search_cache_put(self, subs: List[Any]) -> str:
+        """缓存一轮搜索结果（含完整 sub 对象），返回 search_id；过期/超量先清理"""
+        cache = getattr(self, "_search_cache", None)
+        if cache is None:
+            cache = self._search_cache = {}
+        now = time.time()
+        for k in list(cache.keys()):
+            if now - cache[k][0] > self._SEARCH_TTL:
+                cache.pop(k, None)
+        while len(cache) >= self._SEARCH_KEEP:
+            old = min(cache, key=lambda k: cache[k][0])
+            cache.pop(old, None)
+        sid = "s%d" % int(time.time() * 1000)
+        cache[sid] = (now, subs)
+        return sid
+
+    def search_full_api(self, q: str = "", apikey: str = "", limit: int = 50):
+        """在线搜索字幕：四源并行，返回 search_id + 候选清单（配合 /fetch_sub 下载）"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False, message="API密钥错误")
+        q = (q or "").strip()
+        if not q:
+            return schemas.Response(success=False, message="缺少 q 参数")
+        try:
+            limit = max(min(int(limit or 50), 200), 1)
+        except (TypeError, ValueError):
+            limit = 50
+        subs = self._search_subtitles(q)
+        sid = self._search_cache_put(subs)
+        items = []
+        for i, s in enumerate(subs[:limit]):
+            items.append({
+                "idx": i,
+                "site": getattr(s, "site_name", "") or "",
+                "title": getattr(s, "title", "") or "",
+                "language": getattr(s, "language", "") or "",
+                "se": getattr(s, "season_episode", None),
+                "file_name": getattr(s, "file_name", "") or "",
+                "size": getattr(s, "size", 0) or 0,
+            })
+        return schemas.Response(
+            success=True, message="[%s] 共 %d 条" % (q, len(items)),
+            data={"search_id": sid, "total": len(subs), "items": items})
+
+    def fetch_sub_api(self, search_id: str = "", idx: int = 0,
+                      dest: str = "", apikey: str = ""):
+        """按 search_id+idx 下载所选字幕并解包，写入 dest（MP 视角目录），返回文件清单"""
+        if apikey != settings.API_TOKEN:
+            return schemas.Response(success=False, message="API密钥错误")
+        cache = getattr(self, "_search_cache", None) or {}
+        entry = cache.get(search_id or "")
+        if not entry:
+            return schemas.Response(success=False, message="搜索已过期，请重新搜索")
+        _ts, subs = entry
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            return schemas.Response(success=False, message="idx 非法")
+        if idx < 0 or idx >= len(subs):
+            return schemas.Response(success=False, message="idx 超出范围（共 %d 条）" % len(subs))
+        dest = (dest or "").strip()
+        if not re.match(r"^/media/sata\d+/.+", dest):
+            return schemas.Response(success=False, message="dest 必须在 /media/sata{N}/ 下")
+        sub = subs[idx]
+        content = self._download_content(sub)
+        if not content:
+            return schemas.Response(success=False, message="下载失败或内容为空")
+        files = self._extract_sub_files(
+            content, getattr(sub, "title", "") or getattr(sub, "file_name", "") or "subtitle")
+        if not files:
+            return schemas.Response(success=False, message="解包后没有通过验证的字幕文件")
+        os.makedirs(dest, exist_ok=True)
+        used = set(os.listdir(dest))
+        out = []
+        for name, data in files:
+            safe = Path(name).name
+            if Path(safe).suffix.lower() not in SUB_EXTS:
+                continue
+            if safe in used:
+                safe = "%d_%s" % (int(time.time() * 1000) % 100000, safe)
+            used.add(safe)
+            with open(os.path.join(dest, safe), "wb") as f:
+                f.write(data)
+            out.append({"name": safe, "bytes": len(data)})
+        if not out:
+            return schemas.Response(success=False, message="解包内容中没有字幕格式文件")
+        return schemas.Response(
+            success=True, message="已保存 %d 个字幕" % len(out),
+            data={"dest": dest, "files": out})
 
     def search_test_api(self, keyword: str = "", apikey: str = ""):
         if apikey != settings.API_TOKEN:
