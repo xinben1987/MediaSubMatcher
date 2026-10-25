@@ -150,7 +150,7 @@ class MediaSubMatcher(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/substrata.png"
     # 插件版本
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     # 插件作者
     plugin_author = "leon"
     # 作者主页
@@ -473,12 +473,13 @@ class MediaSubMatcher(_PluginBase):
         align = bool(spec.get("align", True))
         overwrite = bool(spec.get("overwrite", False))
         refresh = bool(spec.get("refresh", True))
+        wait_align = bool(spec.get("wait_align", False))
         # ffsubsync 是外部命令依赖，先确保持久卷 vendor 已进 PATH/PYTHONPATH
         self._ensure_ffs_env()
         results = []
         ok_cnt = 0
         for it in items:
-            r = self._attach_one(it, align, overwrite)
+            r = self._attach_one(it, align, overwrite, wait_align)
             results.append(r)
             if r.get("ok"):
                 ok_cnt += 1
@@ -503,7 +504,8 @@ class MediaSubMatcher(_PluginBase):
             },
         )
 
-    def _attach_one(self, it: dict, align: bool, overwrite: bool) -> Dict[str, Any]:
+    def _attach_one(self, it: dict, align: bool, overwrite: bool,
+                    wait_align: bool = False) -> Dict[str, Any]:
         """单条外部字幕：定位视频 → 读字幕 → 落盘（可覆盖）+ 对齐"""
         video_raw = str(it.get("video") or "").strip()
         sub_raw = str(it.get("sub") or "").strip()
@@ -526,18 +528,26 @@ class MediaSubMatcher(_PluginBase):
         if not content:
             return {"video": video, "sub": sub_raw, "ok": False, "msg": "字幕内容为空"}
         try:
-            saved = self._save_subtitle(video, sub_file.name, content, align, overwrite=overwrite)
+            saved = self._save_subtitle(video, sub_file.name, content, align,
+                                        overwrite=overwrite, wait_align=wait_align)
         except TypeError:
             # 兼容未打 overwrite 补丁的 _save_subtitle
             saved = self._save_subtitle(video, sub_file.name, content, align)
         if not saved:
             return {"video": video, "sub": sub_raw, "ok": False, "msg": "落盘失败（详见插件日志）"}
         ext = Path(sub_file.name).suffix.lower()
+        _anote = getattr(self, "_last_align_note", "")
+        if align and ext in ALIGNABLE_EXTS and _anote:
+            _msg = "已挂载，" + _anote
+        elif align and ext in ALIGNABLE_EXTS:
+            _msg = "已挂载，对齐挂起后台执行"
+        else:
+            _msg = "已挂载（未对齐）"
         return {
             "video": video,
             "sub": sub_raw,
             "ok": True,
-            "msg": "已挂载" + ("，对齐挂起后台执行" if (align and ext in ALIGNABLE_EXTS) else "（未对齐）"),
+            "msg": _msg,
         }
 
     # ---------------- 配置页 ----------------
@@ -1420,6 +1430,38 @@ class MediaSubMatcher(_PluginBase):
         _align_worker_on = True
         if not quiet:
             logger.info(f"{self.plugin_name} 对齐任务已挂起后台：{Path(sub_path).name}")
+
+    def _align_sync(self, video_path: str, sub_path: str) -> Tuple[bool, str]:
+        """内联对齐（手动挂载一次性完成用）：ffsubsync -> 质量门 -> 就地替换；
+        失败/质量未达标时保留原字幕。逻辑与后台 worker 相同，仅同步执行。"""
+        tmp = sub_path + ".aligned" + Path(sub_path).suffix
+        try:
+            self._ensure_ffs_env()
+            ff = shutil.which("ffsubsync")
+            cmd = [ff] if ff else ["python", "-m", "ffsubsync"]
+            cmd += [video_path, "-i", sub_path, "-o", tmp]
+            proc = subprocess.run(cmd, capture_output=True, timeout=1800)
+            if proc.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 100:
+                level, qmsg = self._ffsubsync_quality_check(
+                    (proc.stdout or b"").decode("utf-8", "replace"),
+                    Path(tmp), self._video_duration(video_path))
+                if level in ("fail", "warn"):
+                    os.remove(tmp)
+                    return False, "对齐质量未达标，保留原字幕（%s）" % qmsg
+                os.replace(tmp, sub_path)
+                logger.info(f"{self.plugin_name} 内联对齐完成：{Path(sub_path).name}")
+                return True, "对齐完成"
+            tail = " ".join((proc.stderr or b"").decode("utf-8", "replace").split())[-200:]
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            return False, "ffsubsync 失败 ret=%s %s" % (proc.returncode, tail)
+        except Exception as err:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            return False, "对齐异常：%r" % err
 
     def _align_worker_loop(self):
         import queue
@@ -2945,7 +2987,7 @@ class MediaSubMatcher(_PluginBase):
         return out, note
 
     def _save_subtitle(self, video_path: str, file_name: str, content: bytes, align: bool,
-                       overwrite: bool = False) -> bool:
+                       overwrite: bool = False, wait_align: bool = False) -> bool:
         """
         保存字幕到视频同目录：<视频名>.<标签>.<后缀>
         overwrite=True 时覆盖已存在的同名字幕（外部手动挂载用）；默认 False 保持原「已存在则跳过」行为。
@@ -2985,10 +3027,20 @@ class MediaSubMatcher(_PluginBase):
             # 蓝光原盘（BDMV目录/ISO）：无音轨可抽，直接落盘不对齐
             logger.info(f"{self.plugin_name} 蓝光原盘/ISO，跳过对齐：{Path(video_path).name}")
             need_align = False
+        self._last_align_note = ""
         if need_align:
-            # 先落盘未对齐版（播放立即可用），对齐挂起后台异步完成后自动替换
             try:
                 shutil.move(str(tmp_path), str(final_path))
+            except OSError as err:
+                logger.error(f"{self.plugin_name} 保存字幕失败：{err}")
+                return False
+            if wait_align:
+                _aok, _anote = self._align_sync(str(video), str(final_path))
+                self._last_align_note = _anote
+                self._notify_add("match", final_path.name, "✅ 已匹配（" + _anote + "）")
+                return True
+            # 先落盘未对齐版（播放立即可用），对齐挂起后台异步完成后自动替换
+            try:
                 self._enqueue_align(str(video), str(final_path))
                 self._notify_add("match", final_path.name, "✅ 已匹配（待后台对齐）")
                 return True
